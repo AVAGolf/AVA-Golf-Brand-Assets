@@ -30,6 +30,16 @@ jobs:
           token: ${{ secrets.BRAND_DIST_PAT }}
           path: dist
 
+      - name: Install Git LFS
+        run: |
+          git lfs install
+
+      - name: Configure LFS tracking in output repo
+        run: |
+          cd dist
+          git lfs track "*.zip"
+          git add .gitattributes
+
       - name: Copy zip into output repo
         run: |
           mkdir -p dist/public
