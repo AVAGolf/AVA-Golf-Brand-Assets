@@ -7,11 +7,15 @@ on:
 
 # Builds the brand pack and uploads it straight to the S3 bucket that backs
 # brand.avagolf.com. The zip is intentionally NOT committed to the site repo:
-# it is a large out-of-band binary, so it never touches git/LFS. The site's
-# deploy workflow (main.yml) excludes this key from its `--delete` sync, so a
-# normal site deploy will neither delete nor overwrite it.
+# it is a large out-of-band binary, so it never touches git/LFS.
 #
-# Public URL: https://brand.avagolf.com/AVA_Golf_Brand_Pack.zip
+# It MUST live under the files/ prefix. The site deploy (main.yml) excludes
+# files/* from its `--delete` sync so it survives, and the Fastly config only
+# enables segmented caching + the Range-capable S3 REST backend for
+# `^/files/.*\.zip$`. Anything larger than ~20MB served from any other path
+# 503s ("Response object too large") because Fastly can't buffer it.
+#
+# Public URL: https://brand.avagolf.com/files/AVA_Golf_Brand_Pack.zip
 
 jobs:
   build-and-publish:
@@ -36,7 +40,7 @@ jobs:
           AWS_DEFAULT_REGION: ${{ secrets.S3_BUCKET_REGION }}
         run: |
           aws s3 cp "$RUNNER_TEMP/AVA_Golf_Brand_Pack.zip" \
-            s3://brand.avagolf.com/AVA_Golf_Brand_Pack.zip \
+            s3://brand.avagolf.com/files/AVA_Golf_Brand_Pack.zip \
             --acl public-read \
             --content-type application/zip \
             --cache-control "public, max-age=300"

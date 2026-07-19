@@ -8,7 +8,7 @@ Official brand assets for [AVA Golf](https://avagolf.com).
 
 ## Download
 
-**[⬇ Download AVA_Golf_Brand_Pack.zip](https://brand.avagolf.com/AVA_Golf_Brand_Pack.zip)**
+**[⬇ Download AVA_Golf_Brand_Pack.zip](https://brand.avagolf.com/files/AVA_Golf_Brand_Pack.zip)**
 
 The zip is always current. Any push to this repository automatically rebuilds and republishes it.
 
