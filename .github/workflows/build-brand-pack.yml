@@ -5,51 +5,54 @@ on:
     branches:
       - main
 
+# Builds the brand pack and uploads it straight to the S3 bucket that backs
+# brand.avagolf.com. The zip is intentionally NOT committed to the site repo:
+# it is a large out-of-band binary, so it never touches git/LFS. The site's
+# deploy workflow (main.yml) excludes this key from its `--delete` sync, so a
+# normal site deploy will neither delete nor overwrite it.
+#
+# Public URL: https://brand.avagolf.com/AVA_Golf_Brand_Pack.zip
+
 jobs:
   build-and-publish:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source repo
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          path: source
 
       - name: Build zip
         run: |
-          cd source
-          zip -r ../AVA_Golf_Brand_Pack.zip . \
+          zip -r "$RUNNER_TEMP/AVA_Golf_Brand_Pack.zip" . \
             --exclude "*.git*" \
             --exclude ".github/*"
-          echo "Build complete: AVA_Golf_Brand_Pack.zip"
+          echo "Build complete:"
+          ls -lh "$RUNNER_TEMP/AVA_Golf_Brand_Pack.zip"
 
-      - name: Checkout output repo
-        uses: actions/checkout@v4
+      - name: Upload to S3
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.S3_BUCKET_REGION }}
+        run: |
+          aws s3 cp "$RUNNER_TEMP/AVA_Golf_Brand_Pack.zip" \
+            s3://brand.avagolf.com/AVA_Golf_Brand_Pack.zip \
+            --acl public-read \
+            --content-type application/zip \
+            --cache-control "public, max-age=300"
+
+      # Cache purges are best-effort: S3 is the source of truth and the short
+      # max-age above lets any stale edge copy self-heal within 5 minutes.
+      - name: Invalidate Fastly
+        continue-on-error: true
+        uses: jcoene/fastly-purge-action@master
         with:
-          repository: AVAGolf/brand.avagolf.com
-          token: ${{ secrets.BRAND_DIST_PAT }}
-          path: dist
+          api_key: "${{ secrets.FASTLY_API_KEY }}"
+          service_id: "iN42g1xAhUJCEMKjylOpRW"
 
-      - name: Install Git LFS
-        run: |
-          git lfs install
-
-      - name: Configure LFS tracking in output repo
-        run: |
-          cd dist
-          git lfs track "*.zip"
-          git add .gitattributes
-
-      - name: Copy zip into output repo
-        run: |
-          mkdir -p dist/public
-          cp AVA_Golf_Brand_Pack.zip dist/public/AVA_Golf_Brand_Pack.zip
-
-      - name: Commit and push to output repo
-        run: |
-          cd dist
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add public/AVA_Golf_Brand_Pack.zip
-          git diff --cached --quiet || git commit -m "chore: update brand pack [$(date -u '+%Y-%m-%d %H:%M UTC')]"
-          git push
+      - name: Purge Cloudflare Cache
+        continue-on-error: true
+        uses: nathanvaughn/actions-cloudflare-purge@master
+        with:
+          cf_zone: "e690f4cbe14dc74233ccb7b3a76749cc"
+          cf_auth: ${{ secrets.CLOUDFLARE_PURGE_CACHE_API }}
