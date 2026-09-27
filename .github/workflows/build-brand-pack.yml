@@ -4,59 +4,272 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: >-
+          Version bump, used only when pack content changed since the last
+          release. With no change, the current version is rebuilt and
+          re-uploaded as-is (a repair run).
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
 
 # Builds the brand pack and uploads it straight to the S3 bucket that backs
 # brand.avagolf.com. The zip is intentionally NOT committed to the site repo:
 # it is a large out-of-band binary, so it never touches git/LFS.
 #
-# It MUST live under the files/ prefix. The site deploy (main.yml) excludes
-# files/* from its `--delete` sync so it survives, and the Fastly config only
-# enables segmented caching + the Range-capable S3 REST backend for
-# `^/files/.*\.zip$`. Anything larger than ~20MB served from any other path
-# 503s ("Response object too large") because Fastly can't buffer it.
+# It MUST live under the files/ prefix. The site deploy in
+# AVAGolf/brand.avagolf.com excludes files/* from its `--delete` sync so it
+# survives, and that repo's Fastly Terraform only enables segmented caching +
+# the Range-capable S3 REST backend for `^/files/.*\.zip$`. Anything larger
+# than ~20MB served from any other path 503s ("Response object too large")
+# because Fastly can't buffer it. The manifest, files/brand-pack.json, sits
+# under files/ for the first reason only: it is a few hundred bytes, so the
+# ordinary website backend serves it.
 #
-# Public URL: https://brand.avagolf.com/files/AVA_Golf_Brand_Pack.zip
+# Versioning: a run that finds pack content changed since the newest
+# brand-pack-vX.Y.Z tag publishes the next version and tags it; one that finds
+# nothing changed stops (.github/scripts/brand-pack-version.sh decides). Only
+# the current pack is kept anywhere: each version overwrites the same S3 key,
+# the bucket has no object versioning, and each version's GitHub release
+# carries its change notes but no files.
+#
+# Public URLs:
+#   https://brand.avagolf.com/files/AVA_Golf_Brand_Pack.zip
+#   https://brand.avagolf.com/files/brand-pack.json  (read by the site's build)
+
+permissions:
+  contents: write # push the version tag and create its release
+
+# One publish at a time, never cancelled half way through an upload. If pushes
+# pile up, GitHub keeps only the newest pending run; that is fine, because it
+# builds the latest commit and so includes everything the dropped runs had.
+concurrency:
+  group: brand-pack
+  cancel-in-progress: false
 
 jobs:
   build-and-publish:
+    # A manual run from another branch would publish unmerged content.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BUCKET: brand.avagolf.com
+      PACK_KEY: files/AVA_Golf_Brand_Pack.zip
+      MANIFEST_KEY: files/brand-pack.json
+      PACK_URL: https://brand.avagolf.com/files/AVA_Golf_Brand_Pack.zip
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # the version is worked out from tags and history
+
+      - name: Work out the version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BUMP_INPUT: ${{ inputs.bump }}
+        run: bash .github/scripts/brand-pack-version.sh "$RUNNER_TEMP/brand-pack-notes"
 
       - name: Build zip
+        id: build
+        if: steps.version.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PUBLISHED: ${{ steps.version.outputs.published }}
+          CHANGES_FILE: ${{ steps.version.outputs.changes_file }}
         run: |
-          zip -r "$RUNNER_TEMP/AVA_Golf_Brand_Pack.zip" . \
+          set -euo pipefail
+          zip_path="$RUNNER_TEMP/AVA_Golf_Brand_Pack.zip"
+          meta="$RUNNER_TEMP/brand-pack-meta"
+          filename="AVA_Golf_Brand_Pack_v$VERSION.zip"
+          mkdir -p "$meta"
+
+          zip -r "$zip_path" . \
             --exclude "*.git*" \
             --exclude ".github/*"
-          echo "Build complete:"
-          ls -lh "$RUNNER_TEMP/AVA_Golf_Brand_Pack.zip"
 
+          # Two files at the zip root say which pack this is.
+          cat >"$meta/VERSION.txt" <<EOF
+          AVA Golf Brand Pack
+          Version:   $VERSION
+          Published: $PUBLISHED
+          Commit:    $GITHUB_SHA
+          Source:    $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/tree/$TAG
+          EOF
+          {
+            printf '# AVA Golf Brand Pack %s\n\nPublished %s.\n\n' "$VERSION" "$PUBLISHED"
+            cat "$CHANGES_FILE"
+          } >"$meta/CHANGES.md"
+          zip -j "$zip_path" "$meta/VERSION.txt" "$meta/CHANGES.md"
+
+          bytes=$(stat -c %s "$zip_path")
+          sha256=$(sha256sum "$zip_path" | cut -d ' ' -f 1)
+
+          jq -n \
+            --arg version "$VERSION" \
+            --arg tag "$TAG" \
+            --arg published "$PUBLISHED" \
+            --argjson bytes "$bytes" \
+            --arg sha256 "$sha256" \
+            --arg commit "$GITHUB_SHA" \
+            --arg url "$PACK_URL" \
+            --arg filename "$filename" \
+            '{version: $version, tag: $tag, published: $published, bytes: $bytes,
+              sha256: $sha256, commit: $commit, url: $url, filename: $filename}' \
+            >"$RUNNER_TEMP/brand-pack.json"
+
+          echo "Build complete:"
+          ls -lh "$zip_path"
+          cat "$RUNNER_TEMP/brand-pack.json"
+          {
+            echo "zip=$zip_path"
+            echo "manifest=$RUNNER_TEMP/brand-pack.json"
+            echo "filename=$filename"
+            echo "bytes=$bytes"
+            echo "sha256=$sha256"
+          } >>"$GITHUB_OUTPUT"
+
+      # One fixed key, overwritten in place: this is what keeps only the
+      # current pack. The versioned name reaches the browser through
+      # Content-Disposition instead. `no-cache` makes browsers revalidate on
+      # every download. Fastly ignores it for its own cache (it honours only
+      # public/private/max-age/s-maxage), so the edge keeps the zip for the
+      # service's 5-minute default TTL and the purge below clears it sooner.
+      # The zip goes first so the manifest never names a pack that isn't there.
       - name: Upload to S3
+        id: upload
+        if: steps.version.outputs.publish == 'true'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ secrets.S3_BUCKET_REGION }}
+          AWS_REGION: ${{ secrets.S3_BUCKET_REGION || 'us-east-2' }}
+          ZIP: ${{ steps.build.outputs.zip }}
+          MANIFEST: ${{ steps.build.outputs.manifest }}
+          FILENAME: ${{ steps.build.outputs.filename }}
         run: |
-          aws s3 cp "$RUNNER_TEMP/AVA_Golf_Brand_Pack.zip" \
-            s3://brand.avagolf.com/files/AVA_Golf_Brand_Pack.zip \
+          set -euo pipefail
+          aws s3 cp "$ZIP" "s3://$BUCKET/$PACK_KEY" \
             --acl public-read \
             --content-type application/zip \
-            --cache-control "public, max-age=300"
+            --cache-control "no-cache" \
+            --content-disposition "attachment; filename=\"$FILENAME\"" \
+            --no-progress
+          aws s3 cp "$MANIFEST" "s3://$BUCKET/$MANIFEST_KEY" \
+            --acl public-read \
+            --content-type application/json \
+            --cache-control no-cache \
+            --no-progress
 
-      # Cache purges are best-effort: S3 is the source of truth and the short
-      # max-age above lets any stale edge copy self-heal within 5 minutes.
-      - name: Invalidate Fastly
+      # Best-effort: S3 is the source of truth, and without the purge a stale
+      # edge copy expires within the service's 5-minute default TTL anyway.
+      # Single-URL purges also clear every segment of the segmented zip.
+      - name: Purge the two URLs from Fastly
+        if: steps.version.outputs.publish == 'true'
         continue-on-error: true
-        uses: jcoene/fastly-purge-action@master
-        with:
-          api_key: "${{ secrets.FASTLY_API_KEY }}"
-          service_id: "iN42g1xAhUJCEMKjylOpRW"
+        env:
+          FASTLY_API_KEY: ${{ secrets.FASTLY_API_KEY }}
+        run: |
+          failed=0
+          for key in "$PACK_KEY" "$MANIFEST_KEY"; do
+            echo "Purging brand.avagolf.com/$key"
+            curl --fail-with-body --silent --show-error -X POST \
+              -H "Fastly-Key: $FASTLY_API_KEY" -H "Accept: application/json" \
+              "https://api.fastly.com/purge/brand.avagolf.com/$key" || failed=1
+            echo
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "::warning::A Fastly purge failed; the edge serves the previous copy for up to 5 minutes."
+          fi
+          exit "$failed"
 
-      - name: Purge Cloudflare Cache
+      # Only once the upload has succeeded, so a tag always means "this
+      # version was published". A republish finds both already there.
+      - name: Tag and release
+        if: steps.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          CHANGES_FILE: ${{ steps.version.outputs.changes_file }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
+            echo "Tag $TAG already exists; leaving it where it is."
+          else
+            git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              tag -a "$TAG" -m "Brand pack $VERSION" "$GITHUB_SHA"
+            git push origin "refs/tags/$TAG"
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; leaving it as it is."
+          else
+            # Notes only, no assets: old packs are not kept anywhere.
+            gh release create "$TAG" --verify-tag \
+              --title "Brand pack $VERSION" \
+              --notes-file "$CHANGES_FILE"
+          fi
+
+      # The site reads files/brand-pack.json at build time, so it needs a
+      # rebuild to show the new number. Never fails the job.
+      - name: Redeploy brand.avagolf.com
+        if: steps.version.outputs.publish == 'true'
         continue-on-error: true
-        uses: nathanvaughn/actions-cloudflare-purge@master
-        with:
-          cf_zone: "e690f4cbe14dc74233ccb7b3a76749cc"
-          cf_auth: ${{ secrets.CLOUDFLARE_PURGE_CACHE_API }}
+        env:
+          GH_TOKEN: ${{ secrets.BRAND_DEPLOY_TOKEN }}
+          SITE_REPO: AVAGolf/brand.avagolf.com
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::brand.avagolf.com will show $VERSION at its next scheduled (weekly) deploy. To make it immediate, add a BRAND_DEPLOY_TOKEN secret: a fine-grained token with Actions read/write on AVAGolf/brand.avagolf.com only."
+            exit 0
+          fi
+          # deploy.yml if the site has one, otherwise main.yml.
+          workflow=main.yml
+          if gh api "repos/$SITE_REPO/actions/workflows/deploy.yml" --silent 2>/dev/null; then
+            workflow=deploy.yml
+          fi
+          if gh workflow run "$workflow" -R "$SITE_REPO" --ref main; then
+            echo "::notice::Started $workflow on $SITE_REPO; the site shows $VERSION once that deploy finishes."
+          else
+            echo "::warning::Could not start $workflow on $SITE_REPO; the site shows $VERSION at its next deploy."
+          fi
+          exit 0
+
+      - name: Summary
+        if: ${{ !cancelled() && steps.upload.outcome == 'success' }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          REASON: ${{ steps.version.outputs.reason }}
+          CHANGES_FILE: ${{ steps.version.outputs.changes_file }}
+          FILENAME: ${{ steps.build.outputs.filename }}
+          BYTES: ${{ steps.build.outputs.bytes }}
+          SHA256: ${{ steps.build.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          size=$(awk -v b="$BYTES" 'BEGIN { printf "%.1f MB", b / 1000000 }')
+          reason=${REASON//|/\\|} # a commit subject could hold a table pipe
+          {
+            echo "## Brand pack $VERSION"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | $VERSION (\`$TAG\`) |"
+            echo "| Why | $reason |"
+            echo "| Size | $size ($BYTES bytes) |"
+            echo "| SHA-256 | \`$SHA256\` |"
+            echo "| Download | $PACK_URL (saves as \`$FILENAME\`) |"
+            echo
+            cat "$CHANGES_FILE"
+          } >>"$GITHUB_STEP_SUMMARY"
