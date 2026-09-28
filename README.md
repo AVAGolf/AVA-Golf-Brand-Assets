@@ -54,9 +54,9 @@ The pack carries a version number, shown on [brand.avagolf.com](https://brand.av
 - **Automatic** — every push to `main` that adds, changes, renames, or removes a file in the pack publishes the next patch version, `1.0.0` → `1.0.1`. Pushes that only touch this README, `.gitignore`, or `.github/` publish nothing.
 - **Bigger steps** — put `[minor]` in a commit message for a notable addition (`1.0.1` → `1.1.0`), or `[major]` for a redesign (`1.1.0` → `2.0.0`). The largest marker since the last version wins.
 - **Manual run** — *Actions → Build & Publish Brand Pack → Run workflow* publishes any unpublished change with the bump you pick. With nothing new to publish, it rebuilds and re-uploads the current version as-is, which is how to repair a bad upload.
-- **Manifest** — [`files/brand-pack.json`](https://brand.avagolf.com/files/brand-pack.json) describes the current pack: version, publish date, size, SHA-256, and commit. brand.avagolf.com reads it when it builds.
+- **Manifest** — [`files/brand-pack.json`](https://brand.avagolf.com/files/brand-pack.json) describes the current pack: version, publish date, size, SHA-256, and commit. brand.avagolf.com reads it when it builds, and its homepage reads it again in the browser.
 - **Only the current pack is kept** — each version overwrites the one zip; no older zip is stored anywhere. Every version gets a git tag (`brand-pack-vX.Y.Z`) and a [release](https://github.com/AVAGolf/AVA-Golf-Brand-Assets/releases) listing its changes, but releases carry notes, not files. An older version can always be rebuilt from its tag.
-- **Showing the new number straight away** — the site picks up a new version at its next deploy. To make that immediate, add a `BRAND_DEPLOY_TOKEN` Actions secret to this repository: a fine-grained token with Actions read/write on `AVAGolf/brand.avagolf.com` only. Each publish then starts the site's deploy.
+- **Showing the new number straight away**: brand.avagolf.com's homepage reads the manifest in the browser, so a new version shows there as soon as it's published, with no token to set up. The site's weekly deploy refreshes the rest (its JSON-LD and llms.txt).
 
 ---
 

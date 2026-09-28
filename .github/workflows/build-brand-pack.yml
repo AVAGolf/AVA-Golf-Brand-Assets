@@ -220,31 +220,10 @@ jobs:
               --notes-file "$CHANGES_FILE"
           fi
 
-      # The site reads files/brand-pack.json at build time, so it needs a
-      # rebuild to show the new number. Never fails the job.
-      - name: Redeploy brand.avagolf.com
-        if: steps.version.outputs.publish == 'true'
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ secrets.BRAND_DEPLOY_TOKEN }}
-          SITE_REPO: AVAGolf/brand.avagolf.com
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          if [ -z "$GH_TOKEN" ]; then
-            echo "::notice::brand.avagolf.com will show $VERSION at its next scheduled (weekly) deploy. To make it immediate, add a BRAND_DEPLOY_TOKEN secret: a fine-grained token with Actions read/write on AVAGolf/brand.avagolf.com only."
-            exit 0
-          fi
-          # deploy.yml if the site has one, otherwise main.yml.
-          workflow=main.yml
-          if gh api "repos/$SITE_REPO/actions/workflows/deploy.yml" --silent 2>/dev/null; then
-            workflow=deploy.yml
-          fi
-          if gh workflow run "$workflow" -R "$SITE_REPO" --ref main; then
-            echo "::notice::Started $workflow on $SITE_REPO; the site shows $VERSION once that deploy finishes."
-          else
-            echo "::warning::Could not start $workflow on $SITE_REPO; the site shows $VERSION at its next deploy."
-          fi
-          exit 0
+      # No redeploy of brand.avagolf.com from here: its homepage re-reads
+      # files/brand-pack.json in the browser, so the new number shows as soon
+      # as the manifest above is uploaded, and the site's weekly deploy
+      # refreshes the rest (JSON-LD, llms.txt). No cross-repo token needed.
 
       - name: Summary
         if: ${{ !cancelled() && steps.upload.outcome == 'success' }}
